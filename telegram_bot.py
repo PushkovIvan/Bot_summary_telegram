@@ -32,6 +32,7 @@ class TelegramSummaryBot:
         
         self.messages_storage: Dict[int, Dict[int, List[Dict]]] = {}
         self.tasks_storage: List[Dict[str, Any]] = []
+        self.load_tasks_from_file()
         self.groups_dict = {group["id"]: group for group in self.groups_config}
         self.giga_client = GigaChatClient()
         self.application = None
@@ -68,7 +69,7 @@ class TelegramSummaryBot:
             return False
 
     def save_tasks_to_json(self, filename: str = 'tasks.json') -> bool:
-        """Добавляет новые задачи в файл без полной перезаписи"""
+        """Сохраняет задачи в файл, обновляя существующие и добавляя новые"""
         try:
             # Загружаем текущие задачи из файла
             existing_tasks = []
@@ -76,22 +77,40 @@ class TelegramSummaryBot:
                 with open(filename, 'r', encoding='utf-8') as f:
                     existing_tasks = json.load(f)
             
-            # Объединяем задачи (уникальные по ID)
-            task_ids = {t['id'] for t in existing_tasks}
-            updated_tasks = existing_tasks.copy()
+            # Создаем словарь для быстрого доступа к существующим задачам
+            existing_tasks_dict = {task['id']: task for task in existing_tasks}
+            updated = False
             
+            # Обновляем или добавляем задачи
             for task in self.tasks_storage:
-                if task['id'] not in task_ids:
-                    updated_tasks.append(task)
+                if task['id'] in existing_tasks_dict:
+                    # Если задача уже существует, проверяем нужно ли обновить
+                    existing_task = existing_tasks_dict[task['id']]
+                    
+                    # Особенно важно проверить is_complete и другие ключевые поля
+                    if (existing_task.get('is_complete') != task.get('is_complete') or
+                        existing_task.get('status') != task.get('status') or
+                        existing_task.get('completed_at') != task.get('completed_at')):
+                        
+                        # Находим индекс задачи в списке и заменяем её
+                        idx = next(i for i, t in enumerate(existing_tasks) if t['id'] == task['id'])
+                        existing_tasks[idx] = task
+                        updated = True
+                else:
+                    # Новая задача - добавляем
+                    existing_tasks.append(task)
+                    updated = True
             
-            # Сохраняем объединенный список
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(updated_tasks, f, ensure_ascii=False, indent=2)
-                
+            # Сохраняем только если были изменения
+            if updated or not os.path.exists(filename):
+                with open(filename, 'w', encoding='utf-8') as f:
+                    json.dump(existing_tasks, f, ensure_ascii=False, indent=2)
+                logger.info(f"Задачи сохранены в {filename} (обновлено: {updated})")
+            
             return True
             
         except Exception as e:
-            logger.error(f"Ошибка сохранения задач: {e}")
+            logger.error(f"Ошибка сохранения задач: {e}", exc_info=True)
             return False
         
     async def analyze_for_tasks(self, message_data: Dict[str, Any]) -> bool:
@@ -141,6 +160,7 @@ class TelegramSummaryBot:
                 'assignee': task_data.get('assignee'),
                 'deadline': task_data.get('deadline'),
                 'status': 'new',
+                'is_complete': False,  # Добавляем явно
                 'source_msg_id': message_data['id'],
                 'chat_id': message_data['chat_id'],
                 'topic_id': message_data['topic_id']
@@ -203,7 +223,7 @@ class TelegramSummaryBot:
             # Получаем активные незавершенные задачи
             active_tasks = [
                 task for task in self.tasks_storage 
-                if not task.get('is_complete', False)
+                if not task.get('is_complete', False)  # Используем is_complete везде
             ]
 
             if not active_tasks:
@@ -268,7 +288,7 @@ class TelegramSummaryBot:
             for task in self.tasks_storage:
                 if task['id'] == task_id:
                     task.update({
-                        'is_complete': True,
+                        'is_complete': True,  # Ключ is_complete
                         'completed_at': message_data['timestamp'],
                         'completed_by': message_data['username'],
                         'completion_confidence': result['confidence'],
@@ -341,13 +361,13 @@ class TelegramSummaryBot:
             # Собираем задачи
             completed_tasks = [
                 t for t in self.tasks_storage 
-                if t.get('is_complete', False) and 
+                if t.get('is_complete', False) and  # Используем is_complete
                 datetime.fromisoformat(t['completed_at']).replace(tzinfo=timezone.utc) > time_threshold
             ]
-            
+
             active_tasks = [
                 t for t in self.tasks_storage 
-                if not t.get('is_complete', False)
+                if not t.get('is_complete', False)  # Используем is_complete
             ]
             
             # Собираем сообщения
@@ -375,6 +395,7 @@ class TelegramSummaryBot:
 
             # 2. Формирование промпта
             prompt = self._create_summary_prompt(analysis_messages, completed_tasks, active_tasks)
+            print(prompt)
             summary = await self.giga_client.get_summary(prompt)
             
             # 3. Постобработка результата
@@ -430,7 +451,6 @@ class TelegramSummaryBot:
     2. Без Markdown-разметки
     3. Используй смайлы только для визуального разделения блоков (не более 3-х)
     4. Структура:
-    [Дата и период]
     [Статистика активности]
     [Выполненные поручения]
     [Текущие поручения]
@@ -446,7 +466,7 @@ class TelegramSummaryBot:
     - Выделяй проблемные моменты
 
     Пример заголовков:
-    "ОФИЦИАЛЬНАЯ СВОДКА 20.06.2025"
+    "ОФИЦИАЛЬНАЯ СВОДКА ЗА ПОСЛЕДНИЕ 24 ЧАСА"
     "✅ ВЫПОЛНЕННЫЕ ПОРУЧЕНИЯ"
     "🔴 ТЕКУЩИЕ ЗАДАЧИ"
     "📌 ОСНОВНЫЕ ТЕМЫ"

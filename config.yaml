@@ -8,9 +8,17 @@ token:
   gigachat: 
   telegram:   # Получить у @BotFather
 
+# Настройки Telethon для загрузки истории сообщений
+telethon:
+  api_id:  # Получите на https://my.telegram.org
+  api_hash:   # Получите на https://my.telegram.org
+  phone:   # Ваш номер телефона в международном формате
+
+
+
 # Настройки бота
 bot:
-  summary_time: "13:00"  # Время отправки сводки (24-часовой формат)
+  summary_time: "15:15"  # Время отправки сводки (24-часовой формат)
   max_messages_per_group: 100  # Максимальное количество сообщений для анализа из каждой группы
   summary_language: "ru"  # Язык сводки
 
