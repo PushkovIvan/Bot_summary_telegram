@@ -5,7 +5,7 @@ import os
 import schedule
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 from telegram import Update
 from telegram.ext import Application, ContextTypes, CommandHandler, MessageHandler, filters
@@ -31,12 +31,133 @@ class TelegramSummaryBot:
         self.language = self.config["bot"]["summary_language"]
         
         self.messages_storage: Dict[int, Dict[int, List[Dict]]] = {}
+        self.tasks_storage: List[Dict[str, Any]] = []
         self.groups_dict = {group["id"]: group for group in self.groups_config}
         self.giga_client = GigaChatClient()
         self.application = None
 
         # Инициализация хранилища из JSON при запуске
         self.load_history_from_file()
+
+    def load_tasks_from_file(self, filename: str = 'tasks.json') -> bool:
+        """Загрузка задач с сохранением существующих"""
+        try:
+            if os.path.exists(filename):
+                with open(filename, 'r', encoding='utf-8') as f:
+                    existing_tasks = json.load(f)
+                    
+                # Проверяем, что файл не пустой и содержит корректные данные
+                if isinstance(existing_tasks, list) and len(existing_tasks) > 0:
+                    # Объединяем с текущими задачами (без дубликатов)
+                    existing_ids = {t['id'] for t in self.tasks_storage}
+                    for task in existing_tasks:
+                        if task.get('id') and task['id'] not in existing_ids:
+                            self.tasks_storage.append(task)
+                    
+                    logger.info(f"Загружено {len(existing_tasks)} задач из файла (без дубликатов)")
+                    return True
+            
+            # Если файла нет или он пустой, создаем новый
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(self.tasks_storage, f, ensure_ascii=False, indent=2)
+                
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка загрузки задач: {e}")
+            return False
+
+    def save_tasks_to_json(self, filename: str = 'tasks.json') -> bool:
+        """Добавляет новые задачи в файл без полной перезаписи"""
+        try:
+            # Загружаем текущие задачи из файла
+            existing_tasks = []
+            if os.path.exists(filename):
+                with open(filename, 'r', encoding='utf-8') as f:
+                    existing_tasks = json.load(f)
+            
+            # Объединяем задачи (уникальные по ID)
+            task_ids = {t['id'] for t in existing_tasks}
+            updated_tasks = existing_tasks.copy()
+            
+            for task in self.tasks_storage:
+                if task['id'] not in task_ids:
+                    updated_tasks.append(task)
+            
+            # Сохраняем объединенный список
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(updated_tasks, f, ensure_ascii=False, indent=2)
+                
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка сохранения задач: {e}")
+            return False
+        
+    async def analyze_for_tasks(self, message_data: Dict[str, Any]) -> bool:
+        """Анализ сообщения на наличие задач через GigaChat с обработкой ошибок"""
+        try:
+            if not message_data.get('text'):
+                return False
+
+            prompt = f"""Проанализируй текст сообщения на наличие задач/поручений. Ответь ТОЛЬКО в формате JSON:
+            {{
+                "is_task": bool,
+                "task_text": str | null,
+                "assignee": str | null,
+                "deadline": str | null
+            }}
+
+            Данные сообщения:
+            - Автор: {message_data['username']}
+            - Текст: "{message_data['text']}"
+            """
+
+            response = await self.giga_client.get_summary(prompt)
+            if not response:
+                return False
+
+            # Удаляем возможные некорректные символы перед парсингом
+            response = response.strip()
+            if not response.startswith('{') or not response.endswith('}'):
+                logger.error(f"Некорректный формат ответа: {response}")
+                return False
+
+            try:
+                task_data = json.loads(response)
+            except json.JSONDecodeError as e:
+                logger.error(f"Ошибка парсинга JSON: {e}\nОтвет: {response}")
+                return False
+
+            if not isinstance(task_data, dict) or not task_data.get('is_task', False):
+                return False
+
+            # Создаем новую задачу
+            task = {
+                'id': f"task_{int(datetime.now().timestamp())}",
+                'created_at': message_data['timestamp'],
+                'author': message_data['username'] or 'Unknown',
+                'text': task_data.get('task_text', 'Не указано'),
+                'assignee': task_data.get('assignee'),
+                'deadline': task_data.get('deadline'),
+                'status': 'new',
+                'source_msg_id': message_data['id'],
+                'chat_id': message_data['chat_id'],
+                'topic_id': message_data['topic_id']
+            }
+
+            # Валидация обязательных полей
+            if not task['text'] or task['text'] == 'Не указано':
+                return False
+
+            self.tasks_storage.append(task)
+            self.save_tasks_to_json()
+            logger.info(f"Выявлена новая задача: {task}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Критическая ошибка анализа задачи: {e}", exc_info=True)
+            return False
 
     def load_history_from_file(self, filename: str = 'history.json') -> int:
         """Загрузка всех сообщений из JSON файла"""
@@ -72,9 +193,100 @@ class TelegramSummaryBot:
         except Exception as e:
             logger.error(f"Ошибка сохранения в {filename}: {e}")
             return False
+        
+    async def check_task_completion(self, message_data: Dict[str, Any]) -> bool:
+        """Проверяет, содержит ли сообщение явное подтверждение выполнения задачи"""
+        try:
+            if not self.tasks_storage or not message_data.get('text'):
+                return False
+
+            # Получаем активные незавершенные задачи
+            active_tasks = [
+                task for task in self.tasks_storage 
+                if not task.get('is_complete', False)
+            ]
+
+            if not active_tasks:
+                return False
+
+            # Формируем строгий промпт для анализа
+            tasks_list = "\n".join(
+                f"{idx+1}. [ID: {task['id']}] {task['text']} (Исполнитель: {task.get('assignee', 'не назначен')})"
+                for idx, task in enumerate(active_tasks)
+            )
+            
+            prompt = f"""Анализируй сообщение на ЯВНОЕ подтверждение выполнения задачи. 
+    Ответь ТОЛЬКО в JSON формате:
+    {{
+        "is_completion": bool,  // true ТОЛЬКО если есть явное подтверждение
+        "completed_task_id": str | null,  // ID задачи
+        "confidence": float  // Уверенность в выполнении (0.0-1.0)
+    }}
+
+    Правила определения выполнения:
+    1. Должно быть прямое указание на выполнение ("сделал", "выполнил", "готово")
+    2. Должен быть указан ID задачи или четкое описание
+    3. Минимальная уверенность: 0.8
+
+    Активные задачи:
+    {tasks_list}
+
+    Сообщение для анализа:
+    "{message_data['text']}"
+    Автор: {message_data['username']}
+    """
+
+            response = await self.giga_client.get_summary(prompt)
+            if not response:
+                return False
+
+            # Очистка и парсинг ответа
+            response = response.strip().replace('```json', '').replace('```', '').strip()
+            
+            try:
+                result = json.loads(response)
+            except json.JSONDecodeError as e:
+                logger.error(f"Ошибка парсинга ответа: {e}\nОтвет: {response}")
+                return False
+
+            # Строгая валидация результата
+            if not isinstance(result, dict):
+                return False
+
+            if not result.get('is_completion', False):
+                return False
+
+            if result.get('confidence', 0) < 0.8:
+                logger.info(f"Низкая уверенность в выполнении: {result['confidence']}")
+                return False
+
+            task_id = result.get('completed_task_id')
+            if not task_id:
+                return False
+
+            # Находим и обновляем задачу
+            for task in self.tasks_storage:
+                if task['id'] == task_id:
+                    task.update({
+                        'is_complete': True,
+                        'completed_at': message_data['timestamp'],
+                        'completed_by': message_data['username'],
+                        'completion_confidence': result['confidence'],
+                        'status': 'completed'
+                    })
+                    self.save_tasks_to_json()
+                    
+                    logger.info(f"Задача {task_id} помечена выполненной (уверенность: {result['confidence']})")
+                    return True
+
+            return False
+
+        except Exception as e:
+            logger.error(f"Ошибка проверки выполнения: {str(e)}", exc_info=True)
+            return False
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка входящих сообщений и сохранение в JSON"""
+        """Обработка входящих сообщений"""
         if not update.message or not update.message.chat:
             return
 
@@ -105,26 +317,41 @@ class TelegramSummaryBot:
             )
         }
 
-        # Инициализируем хранилище при необходимости
+        # Сохраняем сообщение в историю
         if chat_id not in self.messages_storage:
             self.messages_storage[chat_id] = {}
         if topic_id not in self.messages_storage[chat_id]:
             self.messages_storage[chat_id][topic_id] = []
-
-        # Добавляем сообщение
+        
         self.messages_storage[chat_id][topic_id].append(message_data)
-        logger.info(f"Сообщение сохранено в {chat_id}/{topic_id}")
-
-        # Сохраняем в JSON (можно оптимизировать для частого сохранения)
         self.save_messages_to_json()
 
+        # Анализируем на наличие задач
+        await self.analyze_for_tasks(message_data)
+
+        # Проверяем на выполнение существующих задач
+        await self.check_task_completion(message_data)
+
     async def create_summary(self) -> Optional[str]:
-        """Создание сводки на основе сообщений за последние 24 часа"""
+        """Генерация детальной сводки через GigaChat"""
         try:
-            # Собираем сообщения за последние 24 часа
+            # 1. Подготовка данных
             time_threshold = datetime.now(timezone.utc) - timedelta(hours=24)
-            analysis_messages = []
             
+            # Собираем задачи
+            completed_tasks = [
+                t for t in self.tasks_storage 
+                if t.get('is_complete', False) and 
+                datetime.fromisoformat(t['completed_at']).replace(tzinfo=timezone.utc) > time_threshold
+            ]
+            
+            active_tasks = [
+                t for t in self.tasks_storage 
+                if not t.get('is_complete', False)
+            ]
+            
+            # Собираем сообщения
+            analysis_messages = []
             for chat_id, topics in self.messages_storage.items():
                 for topic_id, messages in topics.items():
                     for msg in messages:
@@ -143,59 +370,121 @@ class TelegramSummaryBot:
                         except Exception as e:
                             logger.error(f"Ошибка обработки сообщения: {e}")
 
-            if not analysis_messages:
-                logger.warning("Нет сообщений для анализа")
+            if not analysis_messages and not completed_tasks and not active_tasks:
                 return None
 
-            # Формируем промпт для GigaChat
-            prompt = self._create_summary_prompt(analysis_messages)
-            return await self.giga_client.get_summary(prompt)
+            # 2. Формирование промпта
+            prompt = self._create_summary_prompt(analysis_messages, completed_tasks, active_tasks)
+            summary = await self.giga_client.get_summary(prompt)
+            
+            # 3. Постобработка результата
+            if summary:
+                # Удаляем возможные Markdown-теги если они есть
+                for md_tag in ["**", "__", "```", "#"]:
+                    summary = summary.replace(md_tag, "")
+                
+                # Добавляем смайлы к заголовкам
+                summary = summary.replace("ВЫПОЛНЕННЫЕ ПОРУЧЕНИЯ", "✅ ВЫПОЛНЕННЫЕ ПОРУЧЕНИЯ")
+                summary = summary.replace("ТЕКУЩИЕ ПОРУЧЕНИЯ", "🔴 ТЕКУЩИЕ ПОРУЧЕНИЯ")
+                summary = summary.replace("ЗАКЛЮЧЕНИЕ", "📢 ЗАКЛЮЧЕНИЕ")
+                
+                return summary
+            return None
             
         except Exception as e:
             logger.error(f"Ошибка создания сводки: {e}")
             return None
 
-    def _create_summary_prompt(self, messages: List[Dict]) -> str:
-        """Формирование промпта для сводки"""
-        messages_text = "\n".join(
-            f"[{msg['topic']}] {msg['user']}: {msg['text']}"
-            for msg in messages[-self.max_messages:]  # Ограничиваем количество
+    def _create_summary_prompt(self, messages: List[Dict], completed_tasks: List[Dict], active_tasks: List[Dict]) -> str:
+        """Формирование строгого промпта для GigaChat"""
+        tasks_text = "=== ПОРУЧЕНИЯ ===\n"
+        tasks_text += "Завершённые:\n" + "\n".join(
+            f"- {t['text']} (исполнил: {t.get('completed_by', '?')}, {datetime.fromisoformat(t['completed_at']).strftime('%H:%M')})"
+            for t in completed_tasks
+        ) + "\n\nТекущие:\n" + "\n".join(
+            f"- {t['text']} (ответственный: {t.get('assignee', 'не назначен')}, срок: {t.get('deadline', 'не указан')})"
+            for t in active_tasks
         )
-
+        
+        messages_text = "=== ОБСУЖДЕНИЯ ===\n"
+        topics = {}
+        for msg in messages:
+            topic = msg['topic']
+            if topic not in topics:
+                topics[topic] = []
+            topics[topic].append(msg['text'][:100] + "...")
+        
+        for topic, msgs in topics.items():
+            messages_text += f"\nТема: {topic} ({len(msgs)} сообщ.)\n"
+            messages_text += "\n".join(f"- {m}" for m in msgs[:3]) + "\n"
+        
         return f"""
-Создай аналитическую сводку на основе сообщений из Telegram за последние 24 часа.
+    Сформируй официальную сводку за последние 24 часа на основе следующих данных:
 
-**Требования:**
-1. Выдели 3-5 ключевых тем
-2. Отметь важные обсуждения и вопросы
-3. Предложи рекомендации
-4. Будь кратким и конкретным
-5. Язык: {self.language}
-6. Формат: Markdown
+    {tasks_text}
 
-**Сообщения для анализа (последние {len(messages)}):**
-{messages_text}
+    {messages_text}
 
-**Формат сводки:**
-# 📊 Ежедневная сводка ({datetime.now().strftime('%d.%m.%Y')})
+    Требования к сводке:
+    1. Строгий официально-деловой стиль
+    2. Без Markdown-разметки
+    3. Используй смайлы только для визуального разделения блоков (не более 3-х)
+    4. Структура:
+    [Дата и период]
+    [Статистика активности]
+    [Выполненные поручения]
+    [Текущие поручения]
+    [Ключевые темы обсуждений]
+    [Заключение и рекомендации]
 
-## 🔍 Основные темы
-- ...
+    5. Язык: русский
+    6. Объём: 15-25 предложений
+    7. Важные детали:
+    - Указывай конкретные сроки для задач
+    - Цитируй ключевые фразы из обсуждений
+    - Сохраняй нейтральный тон
+    - Выделяй проблемные моменты
 
-## 💬 Важные обсуждения
-- ...
+    Пример заголовков:
+    "ОФИЦИАЛЬНАЯ СВОДКА 20.06.2025"
+    "✅ ВЫПОЛНЕННЫЕ ПОРУЧЕНИЯ"
+    "🔴 ТЕКУЩИЕ ЗАДАЧИ"
+    "📌 ОСНОВНЫЕ ТЕМЫ"
+    "📢 ВЫВОДЫ"
 
-## 🚀 Рекомендации
-- ...
-
-## 📈 Статистика
-- Сообщений: {len(messages)}
-- Групп: {len(self.messages_storage)}
-- Топиков: {sum(len(topics) for topics in self.messages_storage.values())}
-"""
+    Сгенерируй только текст сводки без пояснений. Будь краток и пиши по делу
+    """
+    
+    async def cleanup_old_tasks(self):
+        """Очистка старых задач (старше 24 часов)"""
+        try:
+            time_threshold = datetime.now(timezone.utc) - timedelta(hours=24)
+            initial_count = len(self.tasks_storage)
+            
+            self.tasks_storage = [
+                task for task in self.tasks_storage
+                if datetime.fromisoformat(task['created_at']).replace(tzinfo=timezone.utc) > time_threshold
+            ]
+            
+            removed_count = initial_count - len(self.tasks_storage)
+            if removed_count > 0:
+                self.save_tasks_to_json()
+                logger.info(f"Удалено {removed_count} старых задач")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка очистки задач: {e}")
+            return False
 
     async def send_daily_summary(self):
-        """Отправка ежедневной сводки по расписанию"""
+        """Отправка ежедневной сводки только в будние дни"""
+        today = datetime.now().weekday()
+        if today >= 5:  # 5 и 6 - суббота и воскресенье
+            logger.info("Сегодня выходной, сводка не отправляется")
+            return
+
+        # Очищаем старые задачи перед формированием сводки
+        await self.cleanup_old_tasks()
+        
         summary = await self.create_summary()
         if not summary:
             logger.warning("Не удалось создать сводку")
