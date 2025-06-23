@@ -437,7 +437,7 @@ class TelegramSummaryBot:
         
         for topic, msgs in topics.items():
             messages_text += f"\nТема: {topic} ({len(msgs)} сообщ.)\n"
-            messages_text += "\n".join(f"- {m}" for m in msgs[:3]) + "\n"
+            messages_text += "\n".join(f"- {m}" for m in msgs) + "\n"
         
         return f"""
     Сформируй официальную сводку за последние 24 часа на основе следующих данных:
@@ -494,6 +494,142 @@ class TelegramSummaryBot:
         except Exception as e:
             logger.error(f"Ошибка очистки задач: {e}")
             return False
+        
+    async def _command_weekly_summary(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /weekly_summary"""
+        await update.message.reply_text("⌛ Создаю недельную сводку...")
+        summary = await self.create_weekly_summary()
+        if summary:
+            await update.message.reply_text(summary, parse_mode=None)
+        else:
+            await update.message.reply_text("❌ Не удалось создать недельную сводку")
+
+    async def create_weekly_summary(self) -> Optional[str]:
+        """Генерация недельной сводки через GigaChat"""
+        try:
+            # 1. Подготовка данных за 7 дней
+            time_threshold = datetime.now(timezone.utc) - timedelta(days=7)
+            
+            # Собираем задачи за неделю
+            completed_tasks = [
+                t for t in self.tasks_storage 
+                if t.get('is_complete', False) and
+                datetime.fromisoformat(t['completed_at']).replace(tzinfo=timezone.utc) > time_threshold
+            ]
+
+            active_tasks = [
+                t for t in self.tasks_storage 
+                if not t.get('is_complete', False)
+            ]
+            
+            # Собираем сообщения за неделю
+            analysis_messages = []
+            for chat_id, topics in self.messages_storage.items():
+                for topic_id, messages in topics.items():
+                    for msg in messages:
+                        try:
+                            msg_time = datetime.fromisoformat(msg['timestamp'])
+                            if msg_time.tzinfo is None:
+                                msg_time = msg_time.replace(tzinfo=timezone.utc)
+                            
+                            if msg_time > time_threshold and msg['text'].strip():
+                                analysis_messages.append({
+                                    'text': msg['text'],
+                                    'user': msg.get('username') or msg.get('first_name') or f"user_{msg['user_id']}",
+                                    'time': msg['timestamp'],
+                                    'topic': msg.get('topic_name', 'Основной чат')
+                                })
+                        except Exception as e:
+                            logger.error(f"Ошибка обработки сообщения: {e}")
+
+            if not analysis_messages and not completed_tasks and not active_tasks:
+                return None
+
+            # 2. Формирование промпта для недельной сводки
+            prompt = self._create_weekly_summary_prompt(analysis_messages, completed_tasks, active_tasks)
+            print(prompt)
+            summary = await self.giga_client.get_summary(prompt)
+            
+            # 3. Постобработка результата
+            if summary:
+                # Удаляем возможные Markdown-теги если они есть
+                for md_tag in ["**", "__", "```", "#"]:
+                    summary = summary.replace(md_tag, "")
+                
+                # Добавляем смайлы к заголовкам
+                summary = summary.replace("НЕДЕЛЬНАЯ СВОДКА", "📅 НЕДЕЛЬНАЯ СВОДКА")
+                summary = summary.replace("ВЫПОЛНЕННЫЕ ПОРУЧЕНИЯ", "✅ ВЫПОЛНЕННЫЕ ПОРУЧЕНИЯ")
+                summary = summary.replace("ТЕКУЩИЕ ПОРУЧЕНИЯ", "🔴 ТЕКУЩИЕ ПОРУЧЕНИЯ")
+                summary = summary.replace("ЗАКЛЮЧЕНИЕ", "📢 ЗАКЛЮЧЕНИЕ")
+                
+                return summary
+            return None
+            
+        except Exception as e:
+            logger.error(f"Ошибка создания недельной сводки: {e}")
+            return None
+        
+    def _create_weekly_summary_prompt(self, messages: List[Dict], completed_tasks: List[Dict], active_tasks: List[Dict]) -> str:
+        """Формирование строгого промпта для недельной сводки"""
+        tasks_text = "=== ПОРУЧЕНИЯ ЗА НЕДЕЛЮ ===\n"
+        tasks_text += "Завершённые:\n" + "\n".join(
+            f"- {t['text']} (исполнил: {t.get('completed_by', '?')}, {datetime.fromisoformat(t['completed_at']).strftime('%d.%m %H:%M')})"
+            for t in completed_tasks
+        ) + "\n\nТекущие:\n" + "\n".join(
+            f"- {t['text']} (ответственный: {t.get('assignee', 'не назначен')}, срок: {t.get('deadline', 'не указан')})"
+            for t in active_tasks
+        )
+        
+        messages_text = "=== ОБСУЖДЕНИЯ ЗА НЕДЕЛЮ ===\n"
+        topics = {}
+        for msg in messages:
+            topic = msg['topic']
+            if topic not in topics:
+                topics[topic] = []
+            topics[topic].append(msg['text'][:100] + "...")
+        
+        for topic, msgs in topics.items():
+            messages_text += f"\nТема: {topic} ({len(msgs)} сообщ.)\n"
+            messages_text += "\n".join(f"- {m}" for m in msgs) + "\n"
+        
+        return f"""
+    Сформируй официальную недельную сводку на основе следующих данных:
+
+    {tasks_text}
+
+    {messages_text}
+
+    Требования к сводке:
+    1. Строгий официально-деловой стиль
+    2. Без Markdown-разметки
+    3. Используй смайлы только для визуального разделения блоков (не более 3-х)
+    4. Структура:
+    [Общая статистика за неделю]
+    [Выполненные поручения]
+    [Текущие поручения]
+    [Ключевые темы обсуждений]
+    [Тенденции и изменения за неделю]
+    [Заключение и рекомендации на следующую неделю]
+
+    5. Язык: русский
+    6. Объём: 25-35 предложений
+    7. Важные детали:
+    - Указывай даты выполнения задач
+    - Отмечай динамику по дням недели
+    - Выделяй наиболее активных участников
+    - Подчеркивай основные достижения и проблемы
+
+    Пример заголовков:
+    "📅 НЕДЕЛЬНАЯ СВОДКА ЗА 7 ДНЕЙ"
+    "📊 ОБЩАЯ СТАТИСТИКА"
+    "✅ ВЫПОЛНЕННЫЕ ПОРУЧЕНИЯ"
+    "🔴 ТЕКУЩИЕ ЗАДАЧИ"
+    "📌 ОСНОВНЫЕ ТЕМЫ НЕДЕЛИ"
+    "📈 ТЕНДЕНЦИИ"
+    "📢 РЕКОМЕНДАЦИИ"
+
+    Сгенерируй только текст сводки без пояснений. Будь краток, но выдели ключевые моменты недели.
+    """
 
     async def send_daily_summary(self):
         """Отправка ежедневной сводки только в будние дни"""
@@ -515,7 +651,7 @@ class TelegramSummaryBot:
                 await self.application.bot.send_message(
                     chat_id=group_id,
                     text=summary,
-                    parse_mode='Markdown'
+                    parse_mode=None
                 )
                 logger.info(f"Сводка отправлена в группу {group_id}")
             except Exception as e:
@@ -526,6 +662,7 @@ class TelegramSummaryBot:
         handlers = [
             CommandHandler("start", self._command_start),
             CommandHandler("summary", self._command_summary),
+            CommandHandler("weekly_summary", self._command_weekly_summary),  # Новая команда
             CommandHandler("save", self._command_save),
             MessageHandler(filters.ALL, self.handle_message)
         ]
@@ -535,9 +672,10 @@ class TelegramSummaryBot:
     async def _command_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /start"""
         await update.message.reply_text(
-            "🤖 Бот для ежедневных сводок активирован!\n"
+            "🤖 Бот для ежедневных и недельных сводок активирован!\n"
             "Команды:\n"
-            "/summary - создать сводку сейчас\n"
+            "/summary - создать дневную сводку\n"
+            "/weekly_summary - создать недельную сводку\n"
             "/save - сохранить историю сообщений"
         )
 
