@@ -398,6 +398,7 @@ class TelegramSummaryBot:
             print(prompt)
             summary = await self.giga_client.get_summary(prompt)
             
+            
             # 3. Постобработка результата
             if summary:
                 # Удаляем возможные Markdown-теги если они есть
@@ -408,7 +409,7 @@ class TelegramSummaryBot:
                 summary = summary.replace("ВЫПОЛНЕННЫЕ ПОРУЧЕНИЯ", "✅ ВЫПОЛНЕННЫЕ ПОРУЧЕНИЯ")
                 summary = summary.replace("ТЕКУЩИЕ ПОРУЧЕНИЯ", "🔴 ТЕКУЩИЕ ПОРУЧЕНИЯ")
                 summary = summary.replace("ЗАКЛЮЧЕНИЕ", "📢 ЗАКЛЮЧЕНИЕ")
-                
+                summary = summary.replace("✅ ✅", "✅").replace("📅 📅", "📅").replace("📢 📢", "📢")
                 return summary
             return None
             
@@ -553,7 +554,7 @@ class TelegramSummaryBot:
             prompt = self._create_weekly_summary_prompt(analysis_messages, completed_tasks, active_tasks)
             print(prompt)
             summary = await self.giga_client.get_summary(prompt)
-            
+            # print(summary)
             # 3. Постобработка результата
             if summary:
                 # Удаляем возможные Markdown-теги если они есть
@@ -565,7 +566,7 @@ class TelegramSummaryBot:
                 summary = summary.replace("ВЫПОЛНЕННЫЕ ПОРУЧЕНИЯ", "✅ ВЫПОЛНЕННЫЕ ПОРУЧЕНИЯ")
                 summary = summary.replace("ТЕКУЩИЕ ПОРУЧЕНИЯ", "🔴 ТЕКУЩИЕ ПОРУЧЕНИЯ")
                 summary = summary.replace("ЗАКЛЮЧЕНИЕ", "📢 ЗАКЛЮЧЕНИЕ")
-                
+                summary = summary.replace("✅ ✅", "✅").replace("📅 📅", "📅").replace("🔴 🔴", "🔴").replace("📢 📢", "📢")
                 return summary
             return None
             
